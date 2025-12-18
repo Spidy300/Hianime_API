@@ -17,6 +17,7 @@ Features:
 - Session management
 """
 
+import os
 import re
 import json
 import time
@@ -27,7 +28,11 @@ from dataclasses import dataclass, asdict, field
 from urllib.parse import urljoin, urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from dotenv import load_dotenv
 import requests
+
+# Load environment variables from .env file
+load_dotenv()
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -101,7 +106,7 @@ class Episode:
 class ScraperConfig:
     """Configuration settings for the scraper"""
     
-    BASE_URL = "https://hianime.to"
+    BASE_URL = os.getenv("BASE_URL", "https://hianime.to")
     CDN_URL = "https://cdn.noitatnemucod.net"
     
     # Rate limiting
