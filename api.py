@@ -13,7 +13,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 from dataclasses import asdict
 
-from hianime_scraper import HiAnimeScraper, SearchResult, AnimeInfo, Episode
+from hianime_scraper import HiAnimeScraper, SearchResult, AnimeInfo, Episode, VideoServer, VideoSource
 
 # Import MAL clients
 try:
@@ -98,9 +98,9 @@ async def root():
     return {
         "status": "online",
         "api": "HiAnime + MAL Scraper API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "mal_enabled": MAL_ENABLED,
-        "total_endpoints": 24 if MAL_ENABLED else 16,
+        "total_endpoints": 27 if MAL_ENABLED else 19,
         "endpoints": {
             "search": "/api/search?keyword=naruto",
             "filter": "/api/filter?type=tv&status=airing",
@@ -116,6 +116,9 @@ async def root():
             "producer": "/api/producer/{producer_slug}",
             "anime_details": "/api/anime/{slug}",
             "episodes": "/api/episodes/{slug}",
+            "video_servers": "/api/servers/{episode_id}",
+            "video_sources": "/api/sources/{episode_id}?server_type=sub",
+            "watch_sources": "/api/watch/{anime_slug}?ep={episode_id}&server_type=sub",
             "mal_search": "/api/mal/search?query=naruto",
             "mal_details": "/api/mal/anime/{mal_id}",
             "mal_ranking": "/api/mal/ranking?type=all",
@@ -463,6 +466,82 @@ async def get_episodes(slug: str):
             "success": True,
             "count": len(episodes),
             "data": [asdict(ep) for ep in episodes]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# VIDEO SOURCES
+# -----------------------------------------------------------------------------
+
+@app.get("/api/servers/{episode_id}", tags=["Video Sources"])
+async def get_video_servers(episode_id: str):
+    """
+    Get available video servers for an episode
+    
+    - **episode_id**: Episode ID from the URL (e.g., "2142" from ?ep=2142)
+    
+    Returns list of available servers with their type (sub/dub/raw)
+    """
+    try:
+        servers = scraper.get_video_servers(episode_id)
+        return {
+            "success": True,
+            "episode_id": episode_id,
+            "count": len(servers),
+            "data": [asdict(s) for s in servers]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sources/{episode_id}", tags=["Video Sources"])
+async def get_episode_sources(
+    episode_id: str,
+    server_type: str = Query("sub", description="Server type: sub, dub, or all")
+):
+    """
+    Get video sources/streaming links for an episode
+    
+    - **episode_id**: Episode ID from the URL (e.g., "2142" from ?ep=2142)
+    - **server_type**: Filter by type - "sub" (default), "dub", or "all"
+    
+    Returns embed URLs for each available server.
+    """
+    try:
+        result = scraper.get_episode_sources(episode_id, server_type)
+        return {
+            "success": True,
+            **result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/watch/{anime_slug}", tags=["Video Sources"])
+async def get_watch_sources(
+    anime_slug: str,
+    ep: str = Query(..., description="Episode ID parameter (e.g., 2142)"),
+    server_type: str = Query("sub", description="Server type: sub, dub, or all")
+):
+    """
+    Get video sources from a watch URL format
+    
+    Example: /api/watch/one-piece-100?ep=2142
+    
+    - **anime_slug**: Anime slug (e.g., "one-piece-100")
+    - **ep**: Episode ID parameter from the original URL
+    - **server_type**: Filter by type - "sub" (default), "dub", or "all"
+    
+    This endpoint mimics the HiAnime watch URL structure:
+    https://hianime.to/watch/one-piece-100?ep=2142
+    """
+    try:
+        result = scraper.get_watch_sources(anime_slug, ep, server_type)
+        return {
+            "success": True,
+            **result
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

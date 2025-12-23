@@ -99,6 +99,27 @@ class Episode:
     is_filler: bool = False
 
 
+@dataclass
+class VideoServer:
+    """Data model for video server information"""
+    server_id: str
+    server_name: str
+    server_type: str  # "sub", "dub", or "raw"
+
+
+@dataclass
+class VideoSource:
+    """Data model for video source information"""
+    episode_id: str
+    server_id: str
+    server_name: str
+    server_type: str  # "sub", "dub", or "raw"
+    sources: List[Dict[str, Any]] = field(default_factory=list)  # Contains url, quality, type
+    tracks: List[Dict[str, Any]] = field(default_factory=list)  # Subtitles/captions
+    intro: Optional[Dict[str, int]] = None  # Intro skip times
+    outro: Optional[Dict[str, int]] = None  # Outro skip times
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -812,6 +833,205 @@ class HiAnimeScraper:
         except Exception as e:
             logger.error(f"Failed to fetch episodes: {e}")
             return []
+
+    # =========================================================================
+    # VIDEO SOURCE METHODS
+    # =========================================================================
+    
+    def get_video_servers(self, episode_id: str) -> List[VideoServer]:
+        """
+        Get available video servers for an episode
+        
+        Args:
+            episode_id: Episode ID (e.g., "2142" from ep=2142)
+            
+        Returns:
+            List of VideoServer objects with server info
+        """
+        url = f"{self.base_url}/ajax/v2/episode/servers?episodeId={episode_id}"
+        logger.info(f"Fetching video servers from: {url}")
+        
+        try:
+            headers = self.client._get_headers()
+            headers['Accept'] = 'application/json'
+            headers['X-Requested-With'] = 'XMLHttpRequest'
+            headers['Referer'] = f"{self.base_url}/watch/"
+            
+            response = self.client.session.get(
+                url,
+                headers=headers,
+                timeout=ScraperConfig.REQUEST_TIMEOUT
+            )
+            
+            data = response.json()
+            
+            if not data.get('status'):
+                logger.warning(f"Server fetch failed: {data.get('msg', 'Unknown error')}")
+                return []
+            
+            html = data.get('html', '')
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            servers = []
+            
+            # Parse sub servers
+            sub_servers = soup.select('.servers-sub .server-item')
+            for server in sub_servers:
+                server_id = server.get('data-id', '')
+                server_name = ParserUtils.clean_text(server.text)
+                if server_id:
+                    servers.append(VideoServer(
+                        server_id=server_id,
+                        server_name=server_name,
+                        server_type="sub"
+                    ))
+            
+            # Parse dub servers
+            dub_servers = soup.select('.servers-dub .server-item')
+            for server in dub_servers:
+                server_id = server.get('data-id', '')
+                server_name = ParserUtils.clean_text(server.text)
+                if server_id:
+                    servers.append(VideoServer(
+                        server_id=server_id,
+                        server_name=server_name,
+                        server_type="dub"
+                    ))
+            
+            # Parse raw servers (if any)
+            raw_servers = soup.select('.servers-raw .server-item')
+            for server in raw_servers:
+                server_id = server.get('data-id', '')
+                server_name = ParserUtils.clean_text(server.text)
+                if server_id:
+                    servers.append(VideoServer(
+                        server_id=server_id,
+                        server_name=server_name,
+                        server_type="raw"
+                    ))
+            
+            logger.info(f"Found {len(servers)} servers")
+            return servers
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch video servers: {e}")
+            return []
+    
+    def get_video_source(self, episode_id: str, server_id: str, server_type: str = "sub") -> Optional[VideoSource]:
+        """
+        Get video source URL from a specific server
+        
+        Args:
+            episode_id: Episode ID
+            server_id: Server ID from get_video_servers()
+            server_type: "sub", "dub", or "raw"
+            
+        Returns:
+            VideoSource object with streaming URLs
+        """
+        url = f"{self.base_url}/ajax/v2/episode/sources?id={server_id}"
+        logger.info(f"Fetching video source from: {url}")
+        
+        try:
+            headers = self.client._get_headers()
+            headers['Accept'] = 'application/json'
+            headers['X-Requested-With'] = 'XMLHttpRequest'
+            headers['Referer'] = f"{self.base_url}/watch/"
+            
+            response = self.client.session.get(
+                url,
+                headers=headers,
+                timeout=ScraperConfig.REQUEST_TIMEOUT
+            )
+            
+            data = response.json()
+            
+            # The response contains a 'link' to the embed URL
+            embed_link = data.get('link', '')
+            
+            if not embed_link:
+                logger.warning("No embed link found in response")
+                return None
+            
+            # Return the embed link information
+            return VideoSource(
+                episode_id=episode_id,
+                server_id=server_id,
+                server_name="",  # Will be populated by caller if needed
+                server_type=server_type,
+                sources=[{
+                    "url": embed_link,
+                    "type": "iframe",
+                    "quality": "auto"
+                }],
+                tracks=[],
+                intro=data.get('intro'),
+                outro=data.get('outro')
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch video source: {e}")
+            return None
+    
+    def get_episode_sources(self, episode_id: str, server_type: str = "sub") -> Dict[str, Any]:
+        """
+        Get all video sources for an episode
+        
+        Args:
+            episode_id: Episode ID (e.g., "2142")
+            server_type: Preferred type - "sub", "dub", or "all"
+            
+        Returns:
+            Dictionary with servers and their sources
+        """
+        servers = self.get_video_servers(episode_id)
+        
+        if not servers:
+            return {
+                "episode_id": episode_id,
+                "servers": [],
+                "sources": []
+            }
+        
+        # Filter by type if specified
+        if server_type != "all":
+            servers = [s for s in servers if s.server_type == server_type]
+        
+        sources = []
+        for server in servers:
+            source = self.get_video_source(episode_id, server.server_id, server.server_type)
+            if source:
+                source.server_name = server.server_name
+                sources.append(source)
+        
+        return {
+            "episode_id": episode_id,
+            "servers": [asdict(s) for s in servers],
+            "sources": [asdict(s) for s in sources]
+        }
+    
+    def get_watch_sources(self, anime_slug: str, episode_param: str, server_type: str = "sub") -> Dict[str, Any]:
+        """
+        Get video sources from a watch URL
+        
+        Args:
+            anime_slug: Anime slug (e.g., "one-piece-100")
+            episode_param: Episode parameter (e.g., "2142" from ?ep=2142)
+            server_type: "sub", "dub", or "all"
+            
+        Returns:
+            Dictionary with episode info and video sources
+        """
+        logger.info(f"Getting sources for {anime_slug} episode {episode_param}")
+        
+        # Get episode sources
+        result = self.get_episode_sources(episode_param, server_type)
+        
+        # Add anime and episode info
+        result["anime_slug"] = anime_slug
+        result["watch_url"] = f"{self.base_url}/watch/{anime_slug}?ep={episode_param}"
+        
+        return result
 
     # =========================================================================
     # BULK OPERATIONS
