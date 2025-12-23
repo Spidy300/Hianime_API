@@ -595,11 +595,17 @@ async def get_streaming_links(
         # Add proxy URLs if requested
         if include_proxy_url and result.get('streams'):
             for stream in result['streams']:
+                # Get the referer from stream headers (important for CDN access)
+                stream_headers = stream.get('headers', {})
+                stream_referer = stream_headers.get('Referer', 'https://megacloud.blog/')
+                
                 for source in stream.get('sources', []):
                     original_url = source.get('file', '')
                     if original_url:
                         encoded = base64.b64encode(original_url.encode()).decode()
-                        source['proxy_url'] = f"/api/proxy/m3u8?url={encoded}"
+                        # Include the correct referer for this stream
+                        encoded_referer = base64.b64encode(stream_referer.encode()).decode()
+                        source['proxy_url'] = f"/api/proxy/m3u8?url={encoded}&ref={encoded_referer}"
         
         return result  # Already includes success field
     except Exception as e:
@@ -927,9 +933,10 @@ async def mal_user_get_profile(
 
 @app.get("/api/proxy/m3u8", tags=["Streaming"])
 async def proxy_m3u8(
-    request: "Request",
+    request: Request,
     url: str = Query(..., description="Base64 encoded m3u8 URL"),
-    referer: str = Query("https://megacloud.blog/", description="Referer header")
+    ref: str = Query(None, description="Base64 encoded referer URL"),
+    referer: str = Query("https://megacloud.blog/", description="Referer header (deprecated, use ref)")
 ):
     """
     Proxy endpoint to fetch m3u8 streams through the server.
@@ -938,7 +945,7 @@ async def proxy_m3u8(
     
     Usage:
     1. Base64 encode your m3u8 URL
-    2. Call: /api/proxy/m3u8?url={base64_encoded_url}
+    2. Call: /api/proxy/m3u8?url={base64_encoded_url}&ref={base64_encoded_referer}
     
     Example:
     - Original URL: https://example.com/master.m3u8
@@ -953,11 +960,37 @@ async def proxy_m3u8(
             # If not base64, try using directly
             decoded_url = url
         
+        # Decode referer from base64 if provided
+        actual_referer = referer  # Use old param as fallback
+        if ref:
+            try:
+                actual_referer = base64.b64decode(ref).decode('utf-8')
+            except:
+                pass
+        
+        # Try to determine the correct referer based on the CDN domain
+        if not ref:
+            if 'megacloud' in decoded_url or 'rapid-cloud' in decoded_url:
+                actual_referer = "https://megacloud.blog/"
+            elif 'vidplay' in decoded_url or 'vidstream' in decoded_url:
+                actual_referer = "https://vidplay.site/"
+            elif 'filemoon' in decoded_url:
+                actual_referer = "https://filemoon.sx/"
+            # For other CDNs like rainveil, sunburst, etc., use the embed URL pattern
+            else:
+                actual_referer = "https://megacloud.blog/"
+        
         headers = {
-            "Referer": referer,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+            "Referer": actual_referer,
+            "Origin": actual_referer.rstrip('/').rsplit('/', 1)[0] if '/' in actual_referer else actual_referer,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "*/*",
-            "Origin": referer.rstrip('/'),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
         }
         
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
@@ -984,6 +1017,9 @@ async def proxy_m3u8(
                 lines = content.decode('utf-8').split('\n')
                 new_lines = []
                 
+                # Encode the referer to pass along to sub-requests
+                encoded_referer = base64.b64encode(actual_referer.encode()).decode()
+                
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -998,7 +1034,7 @@ async def proxy_m3u8(
                                 if not uri.startswith('http'):
                                     uri = f"{base_url}/{uri}"
                                 encoded = base64.b64encode(uri.encode()).decode()
-                                return f'URI="{api_base_url}/api/proxy/segment?url={encoded}"'
+                                return f'URI="{api_base_url}/api/proxy/segment?url={encoded}&ref={encoded_referer}"'
                             line = re.sub(r'URI="([^"]+)"', replace_uri, line)
                         new_lines.append(line)
                     else:
@@ -1010,11 +1046,11 @@ async def proxy_m3u8(
                         # Encode and proxy through appropriate endpoint
                         encoded = base64.b64encode(segment_url.encode()).decode()
                         if segment_url.endswith('.m3u8'):
-                            # Sub-playlist - proxy through m3u8 endpoint
-                            proxied_url = f"{api_base_url}/api/proxy/m3u8?url={encoded}"
+                            # Sub-playlist - proxy through m3u8 endpoint with referer
+                            proxied_url = f"{api_base_url}/api/proxy/m3u8?url={encoded}&ref={encoded_referer}"
                         else:
-                            # Segment (.ts, .aac, etc.) - proxy through segment endpoint
-                            proxied_url = f"{api_base_url}/api/proxy/segment?url={encoded}"
+                            # Segment (.ts, .aac, etc.) - proxy through segment endpoint with referer
+                            proxied_url = f"{api_base_url}/api/proxy/segment?url={encoded}&ref={encoded_referer}"
                         new_lines.append(proxied_url)
                 
                 content = '\n'.join(new_lines).encode('utf-8')
@@ -1039,7 +1075,8 @@ async def proxy_m3u8(
 @app.get("/api/proxy/segment", tags=["Streaming"])
 async def proxy_segment(
     url: str = Query(..., description="Base64 encoded segment URL"),
-    referer: str = Query("https://megacloud.blog/", description="Referer header")
+    ref: str = Query(None, description="Base64 encoded referer URL"),
+    referer: str = Query("https://megacloud.blog/", description="Referer header (deprecated, use ref)")
 ):
     """
     Proxy endpoint for HLS segments (.ts, .aac, encryption keys, etc.).
@@ -1052,11 +1089,21 @@ async def proxy_segment(
         except:
             decoded_url = url
         
+        # Decode referer from base64 if provided
+        actual_referer = referer
+        if ref:
+            try:
+                actual_referer = base64.b64decode(ref).decode('utf-8')
+            except:
+                pass
+        
         headers = {
-            "Referer": referer,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+            "Referer": actual_referer,
+            "Origin": actual_referer.rstrip('/').rsplit('/', 1)[0] if '/' in actual_referer else actual_referer,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "*/*",
-            "Origin": referer.rstrip('/'),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
         }
         
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
