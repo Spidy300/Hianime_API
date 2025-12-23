@@ -6,7 +6,7 @@ FastAPI REST API for accessing HiAnime scraper functionality
 Run with: uvicorn api:app --reload --port 8000
 """
 
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from typing import Optional, List
@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from dataclasses import asdict
 import httpx
 import base64
+import re
 
 from hianime_scraper import HiAnimeScraper, SearchResult, AnimeInfo, Episode, VideoServer, VideoSource
 
@@ -926,12 +927,14 @@ async def mal_user_get_profile(
 
 @app.get("/api/proxy/m3u8", tags=["Streaming"])
 async def proxy_m3u8(
+    request: "Request",
     url: str = Query(..., description="Base64 encoded m3u8 URL"),
     referer: str = Query("https://megacloud.blog/", description="Referer header")
 ):
     """
     Proxy endpoint to fetch m3u8 streams through the server.
     This bypasses Cloudflare protection by making the request server-side.
+    All segment URLs are rewritten to go through the proxy for seamless playback.
     
     Usage:
     1. Base64 encode your m3u8 URL
@@ -969,18 +972,51 @@ async def proxy_m3u8(
             content = response.content
             content_type = response.headers.get('content-type', 'application/vnd.apple.mpegurl')
             
-            # If it's an m3u8 playlist, we need to rewrite the URLs to also go through proxy
+            # Get base URL for the API proxy
+            # Use X-Forwarded headers if behind reverse proxy, otherwise use request base
+            forwarded_proto = request.headers.get('x-forwarded-proto', request.url.scheme)
+            forwarded_host = request.headers.get('x-forwarded-host', request.url.netloc)
+            api_base_url = f"{forwarded_proto}://{forwarded_host}"
+            
+            # If it's an m3u8 playlist, rewrite ALL URLs to go through our proxy
             if b'#EXTM3U' in content or '.m3u8' in decoded_url:
-                # Rewrite relative URLs in the m3u8 to absolute
                 base_url = '/'.join(decoded_url.split('/')[:-1])
                 lines = content.decode('utf-8').split('\n')
                 new_lines = []
+                
                 for line in lines:
-                    if line and not line.startswith('#'):
-                        # This is a URL line
-                        if not line.startswith('http'):
-                            line = f"{base_url}/{line}"
-                    new_lines.append(line)
+                    line = line.strip()
+                    if not line:
+                        new_lines.append(line)
+                        continue
+                    
+                    if line.startswith('#'):
+                        # Handle URI in tags like #EXT-X-KEY:URI="..."
+                        if 'URI="' in line:
+                            def replace_uri(match):
+                                uri = match.group(1)
+                                if not uri.startswith('http'):
+                                    uri = f"{base_url}/{uri}"
+                                encoded = base64.b64encode(uri.encode()).decode()
+                                return f'URI="{api_base_url}/api/proxy/segment?url={encoded}"'
+                            line = re.sub(r'URI="([^"]+)"', replace_uri, line)
+                        new_lines.append(line)
+                    else:
+                        # This is a URL line (segment or sub-playlist)
+                        segment_url = line
+                        if not segment_url.startswith('http'):
+                            segment_url = f"{base_url}/{segment_url}"
+                        
+                        # Encode and proxy through appropriate endpoint
+                        encoded = base64.b64encode(segment_url.encode()).decode()
+                        if segment_url.endswith('.m3u8'):
+                            # Sub-playlist - proxy through m3u8 endpoint
+                            proxied_url = f"{api_base_url}/api/proxy/m3u8?url={encoded}"
+                        else:
+                            # Segment (.ts, .aac, etc.) - proxy through segment endpoint
+                            proxied_url = f"{api_base_url}/api/proxy/segment?url={encoded}"
+                        new_lines.append(proxied_url)
+                
                 content = '\n'.join(new_lines).encode('utf-8')
             
             return Response(
@@ -988,10 +1024,66 @@ async def proxy_m3u8(
                 media_type=content_type,
                 headers={
                     "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
                     "Cache-Control": "no-cache"
                 }
             )
             
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/proxy/segment", tags=["Streaming"])
+async def proxy_segment(
+    url: str = Query(..., description="Base64 encoded segment URL"),
+    referer: str = Query("https://megacloud.blog/", description="Referer header")
+):
+    """
+    Proxy endpoint for HLS segments (.ts, .aac, encryption keys, etc.).
+    This is the main segment proxy used by the m3u8 rewriter.
+    Automatically detects content type from the response.
+    """
+    try:
+        try:
+            decoded_url = base64.b64decode(url).decode('utf-8')
+        except:
+            decoded_url = url
+        
+        headers = {
+            "Referer": referer,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+            "Accept": "*/*",
+            "Origin": referer.rstrip('/'),
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.get(decoded_url, headers=headers)
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="Segment fetch failed")
+            
+            # Determine content type from response or URL
+            content_type = response.headers.get('content-type', 'application/octet-stream')
+            if decoded_url.endswith('.ts'):
+                content_type = "video/mp2t"
+            elif decoded_url.endswith('.aac') or decoded_url.endswith('.m4a'):
+                content_type = "audio/aac"
+            elif decoded_url.endswith('.key') or 'key' in decoded_url:
+                content_type = "application/octet-stream"
+            
+            return Response(
+                content=response.content,
+                media_type=content_type,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                    "Cache-Control": "max-age=3600"
+                }
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -1004,7 +1096,7 @@ async def proxy_ts_segment(
     referer: str = Query("https://megacloud.blog/", description="Referer header")
 ):
     """
-    Proxy endpoint for .ts video segments.
+    Proxy endpoint for .ts video segments (legacy - use /api/proxy/segment instead).
     Use this when playing HLS streams that require header authentication.
     """
     try:
@@ -1027,7 +1119,11 @@ async def proxy_ts_segment(
             return Response(
                 content=response.content,
                 media_type="video/mp2t",
-                headers={"Access-Control-Allow-Origin": "*"}
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
             )
     except HTTPException:
         raise
