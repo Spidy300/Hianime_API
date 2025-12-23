@@ -383,9 +383,19 @@ open http://localhost:8000/docs
 1. Fork this repository
 2. Create new Web Service on Render
 3. Connect your repo
-4. Set build command: `pip install -r requirements.txt`
-5. Set start command: `uvicorn api:app --host 0.0.0.0 --port $PORT`
-6. Add these environment variables in Render dashboard:
+4. Configure the service:
+
+   **Build Command:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+   **Start Command:**
+   ```bash
+   uvicorn api:app --host 0.0.0.0 --port $PORT
+   ```
+
+5. Add these environment variables in Render dashboard:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
