@@ -385,8 +385,24 @@ open http://localhost:8000/docs
 3. Connect your repo
 4. Set build command: `pip install -r requirements.txt`
 5. Set start command: `uvicorn api:app --host 0.0.0.0 --port $PORT`
-6. Add environment variables (optional):
-   - `MAL_CLIENT_ID`: Your MAL API client ID
+6. Add these environment variables in Render dashboard:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BASE_URL` | ✅ Yes | `https://hianimez.is` |
+| `MAL_CLIENT_ID` | ❌ Optional | Your MAL API client ID (for MAL features) |
+| `MAL_CLIENT_SECRET` | ❌ Optional | Your MAL API client secret |
+| `MAL_REDIRECT_URI` | ❌ Optional | Your OAuth redirect URI |
+
+**Environment Variables Example:**
+```env
+BASE_URL=https://hianimez.is
+MAL_CLIENT_ID=your_client_id_here
+MAL_CLIENT_SECRET=your_client_secret_here
+MAL_REDIRECT_URI=https://your-app.com/callback
+```
+
+> **Note:** `BASE_URL` is required for the scraper to work. MAL variables are only needed if you want to use MyAnimeList integration features.
 
 ---
 
