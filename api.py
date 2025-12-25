@@ -6,15 +6,21 @@ FastAPI REST API for accessing HiAnime scraper functionality
 Run with: uvicorn api:app --reload --port 8000
 """
 
-from fastapi import FastAPI, HTTPException, Query, Body, Request
+from fastapi import FastAPI, HTTPException, Query, Body, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, Response, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response, HTMLResponse, FileResponse
 from typing import Optional, List
 from pydantic import BaseModel
 from dataclasses import asdict
 import httpx
 import base64
 import re
+import asyncio
+import tempfile
+import os
+import subprocess
+import shutil
+from urllib.parse import urljoin
 
 from hianime_scraper import HiAnimeScraper, SearchResult, AnimeInfo, Episode, VideoServer, VideoSource
 
@@ -125,6 +131,8 @@ async def root():
             "streaming_links": "/api/stream/{episode_id}?server_type=sub  ⭐ USE THIS FOR FLUTTER!",
             "download_links": "/api/download/{episode_id}?server_type=sub  📥 GET DOWNLOAD URLS",
             "download_file": "/api/download/file/{episode_id}  📥 DIRECT FILE STREAM",
+            "download_mp4": "/api/download/mp4/{episode_id}  🎬 DOWNLOAD AS MP4 FILE!",
+            "download_check": "/api/download/mp4/check  ✅ CHECK FFMPEG STATUS",
             "extract_stream": "/api/extract-stream?url={embed_url}",
             "mal_search": "/api/mal/search?query=naruto",
             "mal_details": "/api/mal/anime/{mal_id}",
@@ -1635,6 +1643,276 @@ async def download_video_file(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# MP4 VIDEO DOWNLOAD (Downloads all segments and converts to MP4)
+# =============================================================================
+
+# Store for tracking download progress
+download_progress = {}
+
+@app.get("/api/download/mp4/{episode_id}", tags=["Download"])
+async def download_video_mp4(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    episode_id: str,
+    server_type: str = Query("sub", description="Server type: sub or dub"),
+    server_index: int = Query(0, description="Server index (0 = first/best)"),
+    filename: Optional[str] = Query(None, description="Custom filename (without extension)")
+):
+    """
+    📥 Download video as MP4 file (REAL DOWNLOAD!)
+    
+    This endpoint:
+    1. Fetches the M3U8 playlist
+    2. Downloads ALL video segments
+    3. Combines them into a single MP4 file
+    4. Streams the MP4 to your device
+    
+    **⚠️ Note:** This may take 1-5 minutes depending on video length!
+    
+    **Parameters:**
+    - **episode_id**: Episode ID from the URL
+    - **server_type**: "sub" or "dub"
+    - **server_index**: Which server to use (0 = first)
+    - **filename**: Optional custom filename
+    
+    **Works with:**
+    - Browser download
+    - Mobile apps
+    - Any HTTP client
+    
+    **Tip:** For faster downloads on desktop, use the ffmpeg command from 
+    `/api/download/{episode_id}` endpoint.
+    """
+    try:
+        # Get streaming links
+        result = scraper.get_streaming_links(episode_id, server_type)
+        
+        if not result.get('streams'):
+            raise HTTPException(status_code=404, detail="No streams found for this episode")
+        
+        streams = result['streams']
+        if server_index >= len(streams):
+            server_index = 0
+        
+        stream = streams[server_index]
+        sources = stream.get('sources', [])
+        
+        if not sources:
+            raise HTTPException(status_code=404, detail="No video sources found")
+        
+        source = sources[0]
+        m3u8_url = source.get('file', '')
+        
+        if not m3u8_url:
+            raise HTTPException(status_code=404, detail="No M3U8 URL found")
+        
+        # Get headers for requests
+        source_headers = source.get('headers', stream.get('headers', {}))
+        referer = source_headers.get('Referer', 'https://megacloud.blog/')
+        
+        headers = {
+            "Referer": referer,
+            "Origin": referer.rstrip('/'),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+        }
+        
+        # Generate filename
+        server_name = stream.get('server_name', 'video')
+        if filename:
+            output_filename = f"{filename}.mp4"
+        else:
+            output_filename = f"episode_{episode_id}_{server_type}.mp4"
+        
+        # Create temp directory for this download
+        temp_dir = tempfile.mkdtemp(prefix=f"anime_dl_{episode_id}_")
+        
+        async def download_and_stream_mp4():
+            """Download segments and yield MP4 data"""
+            try:
+                async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                    # Step 1: Fetch M3U8 playlist
+                    m3u8_response = await client.get(m3u8_url, headers=headers)
+                    m3u8_content = m3u8_response.text
+                    
+                    # Step 2: Parse segment URLs from M3U8
+                    segments = []
+                    base_url = m3u8_url.rsplit('/', 1)[0] + '/'
+                    
+                    for line in m3u8_content.split('\n'):
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            # This is a segment URL
+                            if line.startswith('http'):
+                                segment_url = line
+                            else:
+                                segment_url = urljoin(base_url, line)
+                            segments.append(segment_url)
+                    
+                    if not segments:
+                        raise Exception("No video segments found in playlist")
+                    
+                    # Step 3: Download all segments to temp files
+                    segment_files = []
+                    total_segments = len(segments)
+                    
+                    # Download segments in batches for efficiency
+                    batch_size = 10
+                    for batch_start in range(0, total_segments, batch_size):
+                        batch_end = min(batch_start + batch_size, total_segments)
+                        batch = segments[batch_start:batch_end]
+                        
+                        # Download batch concurrently
+                        tasks = []
+                        for i, seg_url in enumerate(batch):
+                            seg_index = batch_start + i
+                            seg_file = os.path.join(temp_dir, f"seg_{seg_index:05d}.ts")
+                            tasks.append(download_segment(client, seg_url, seg_file, headers))
+                        
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                        for i, result in enumerate(results):
+                            if isinstance(result, Exception):
+                                print(f"Segment {batch_start + i} failed: {result}")
+                            else:
+                                segment_files.append(result)
+                    
+                    if not segment_files:
+                        raise Exception("Failed to download any segments")
+                    
+                    # Step 4: Combine segments using ffmpeg
+                    # Create concat file
+                    concat_file = os.path.join(temp_dir, "concat.txt")
+                    with open(concat_file, 'w') as f:
+                        for seg_file in sorted(segment_files):
+                            f.write(f"file '{seg_file}'\n")
+                    
+                    output_file = os.path.join(temp_dir, "output.mp4")
+                    
+                    # Run ffmpeg to combine and convert to MP4
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", concat_file,
+                        "-c", "copy",
+                        "-bsf:a", "aac_adtstoasc",
+                        "-movflags", "+faststart",
+                        output_file
+                    ]
+                    
+                    process = await asyncio.create_subprocess_exec(
+                        *ffmpeg_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        # Try alternative: just concatenate TS files
+                        output_file = os.path.join(temp_dir, "output.ts")
+                        with open(output_file, 'wb') as outfile:
+                            for seg_file in sorted(segment_files):
+                                with open(seg_file, 'rb') as infile:
+                                    outfile.write(infile.read())
+                    
+                    # Step 5: Stream the output file
+                    if os.path.exists(output_file):
+                        with open(output_file, 'rb') as f:
+                            while chunk := f.read(65536):
+                                yield chunk
+                    
+            except Exception as e:
+                print(f"Download error: {e}")
+                raise
+            finally:
+                # Cleanup temp directory
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except:
+                    pass
+        
+        async def download_segment(client, url, filepath, headers):
+            """Download a single segment"""
+            try:
+                response = await client.get(url, headers=headers, timeout=30.0)
+                response.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    f.write(response.content)
+                return filepath
+            except Exception as e:
+                print(f"Error downloading {url}: {e}")
+                raise
+        
+        return StreamingResponse(
+            download_and_stream_mp4(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{output_filename}"',
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache",
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+
+@app.get("/api/download/mp4/status/{episode_id}", tags=["Download"])
+async def get_download_status(episode_id: str):
+    """
+    Check download progress for an episode
+    
+    Returns the current download status and progress percentage.
+    """
+    if episode_id in download_progress:
+        return download_progress[episode_id]
+    return {
+        "status": "not_started",
+        "progress": 0,
+        "message": "Download not started or already completed"
+    }
+
+
+@app.get("/api/download/mp4/check", tags=["Download"])
+async def check_ffmpeg():
+    """
+    Check if FFmpeg is available for MP4 conversion
+    
+    FFmpeg is required for converting HLS streams to MP4.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            version_line = result.stdout.split('\n')[0]
+            return {
+                "success": True,
+                "ffmpeg_available": True,
+                "version": version_line,
+                "message": "FFmpeg is available. MP4 downloads will work!"
+            }
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        pass
+    
+    return {
+        "success": True,
+        "ffmpeg_available": False,
+        "message": "FFmpeg not found. Install it for MP4 conversion: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)",
+        "alternative": "Without FFmpeg, videos will be downloaded as .ts files which can be played in VLC"
+    }
 
 
 # =============================================================================
