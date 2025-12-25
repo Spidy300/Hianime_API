@@ -107,9 +107,9 @@ async def root():
     return {
         "status": "online",
         "api": "HiAnime + MAL Scraper API",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "mal_enabled": MAL_ENABLED,
-        "total_endpoints": 31 if MAL_ENABLED else 23,
+        "total_endpoints": 30 if MAL_ENABLED else 22,
         "endpoints": {
             "search": "/api/search?keyword=naruto",
             "filter": "/api/filter?type=tv&status=airing",
@@ -130,7 +130,6 @@ async def root():
             "watch_sources": "/api/watch/{anime_slug}?ep={episode_id}&server_type=sub",
             "streaming_links": "/api/stream/{episode_id}?server_type=sub  ⭐ USE THIS FOR FLUTTER!",
             "download_links": "/api/download/{episode_id}?server_type=sub  📥 GET DOWNLOAD URLS",
-            "download_file": "/api/download/file/{episode_id}  📥 DIRECT FILE STREAM",
             "download_mp4": "/api/download/mp4/{episode_id}  🎬 DOWNLOAD AS MP4 FILE!",
             "download_check": "/api/download/mp4/check  ✅ CHECK FFMPEG STATUS",
             "extract_stream": "/api/extract-stream?url={embed_url}",
@@ -1554,93 +1553,6 @@ async def get_download_links(
             }
         }
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/download/file/{episode_id}", tags=["Download"])
-async def download_video_file(
-    request: Request,
-    episode_id: str,
-    server_type: str = Query("sub", description="Server type: sub or dub"),
-    server_index: int = Query(0, description="Server index (0 = first/best)")
-):
-    """
-    📥 Direct video file streaming endpoint (for download managers)
-    
-    This endpoint streams the video file through the server, making it 
-    downloadable without any special headers or tools.
-    
-    **Perfect for:**
-    - Browser "Save As" download
-    - Mobile app download managers
-    - Any HTTP client without header support
-    
-    **Parameters:**
-    - **episode_id**: Episode ID
-    - **server_type**: "sub" or "dub"
-    - **server_index**: Which server to use (0 = first available)
-    
-    **Note:** This streams through our server, so download speed depends on 
-    server bandwidth. For large files, consider using the /api/download/{episode_id}
-    endpoint and downloading directly from CDN with proper headers.
-    """
-    try:
-        result = scraper.get_streaming_links(episode_id, server_type)
-        
-        if not result.get('streams'):
-            raise HTTPException(status_code=404, detail="No streams found")
-        
-        # Get the requested server
-        streams = result['streams']
-        if server_index >= len(streams):
-            server_index = 0
-        
-        stream = streams[server_index]
-        sources = stream.get('sources', [])
-        
-        if not sources:
-            raise HTTPException(status_code=404, detail="No sources in stream")
-        
-        # Get the first source
-        source = sources[0]
-        direct_url = source.get('file', '')
-        
-        if not direct_url:
-            raise HTTPException(status_code=404, detail="No video URL found")
-        
-        # Get headers
-        source_headers = source.get('headers', stream.get('headers', {}))
-        referer = source_headers.get('Referer', 'https://megacloud.blog/')
-        
-        headers = {
-            "Referer": referer,
-            "Origin": referer.rstrip('/'),
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        }
-        
-        # Stream the content
-        async def stream_video():
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                async with client.stream("GET", direct_url, headers=headers) as response:
-                    async for chunk in response.aiter_bytes(chunk_size=65536):
-                        yield chunk
-        
-        # Generate filename
-        server_name = stream.get('server_name', 'video')
-        filename = f"episode_{episode_id}_{server_name}_{server_type}.m3u8"
-        
-        return StreamingResponse(
-            stream_video(),
-            media_type="application/vnd.apple.mpegurl",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Access-Control-Allow-Origin": "*",
-            }
-        )
-        
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
