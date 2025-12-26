@@ -1604,13 +1604,16 @@ async def download_video_mp4(
     server_type: str = Query("sub", description="Server type: sub or dub"),
     server_index: int = Query(0, description="Server index (0 = first/best)"),
     filename: Optional[str] = Query(None, description="Custom filename (without extension)"),
-    quality: str = Query("best", description="Quality: best, 1080, 720, 480, 360")
+    quality: str = Query("best", description="Quality: best, 1080, 720, 480, 360"),
+    auto_fallback: bool = Query(True, description="Auto-try other servers if blocked")
 ):
     """
     📥 Download video as MP4 - FAST PARALLEL SEGMENT DOWNLOAD!
     
     Downloads segments in parallel (100 concurrent) and merges them into MP4.
     Handles encrypted/protected HLS streams with .jpg segments.
+    
+    If a server is blocked by Cloudflare, it will automatically try alternative servers.
     """
     temp_dir = None
     try:
@@ -1621,21 +1624,82 @@ async def download_video_mp4(
             raise HTTPException(status_code=404, detail="No streams found")
         
         streams = result['streams']
-        if server_index >= len(streams):
+        total_servers = len(streams)
+        
+        if server_index >= total_servers:
             server_index = 0
         
-        stream = streams[server_index]
+        # Build list of servers to try (requested one first, then others)
+        servers_to_try = [server_index]
+        if auto_fallback:
+            servers_to_try.extend([i for i in range(total_servers) if i != server_index])
+        
+        last_error = None
+        working_stream = None
+        working_server_idx = None
+        
+        for try_idx in servers_to_try:
+            stream = streams[try_idx]
+            sources = stream.get('sources', [])
+            
+            if not sources:
+                last_error = f"Server {try_idx}: No sources found"
+                continue
+            
+            source = sources[0]
+            test_url = source.get('file', '')
+            
+            if not test_url:
+                last_error = f"Server {try_idx}: No M3U8 URL"
+                continue
+            
+            source_headers = source.get('headers', stream.get('headers', {}))
+            test_referer = source_headers.get('Referer', 'https://megacloud.blog/')
+            
+            # Quick test to see if this server is blocked
+            try:
+                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as test_client:
+                    test_resp = await test_client.get(
+                        test_url,
+                        headers={
+                            "Referer": test_referer,
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        }
+                    )
+                    
+                    if test_resp.status_code == 403:
+                        print(f"⚠️ Server {try_idx} blocked (403), trying next...")
+                        last_error = f"Server {try_idx}: Blocked by Cloudflare (403)"
+                        continue
+                    
+                    test_content = test_resp.text[:500]
+                    if '<!DOCTYPE' in test_content or 'cloudflare' in test_content.lower() or 'blocked' in test_content.lower():
+                        print(f"⚠️ Server {try_idx} returned Cloudflare page, trying next...")
+                        last_error = f"Server {try_idx}: Cloudflare protection active"
+                        continue
+                    
+                    # This server works!
+                    print(f"✅ Server {try_idx} is accessible")
+                    working_stream = stream
+                    working_server_idx = try_idx
+                    break
+                    
+            except Exception as e:
+                print(f"⚠️ Server {try_idx} test failed: {e}")
+                last_error = f"Server {try_idx}: {str(e)}"
+                continue
+        
+        if not working_stream:
+            raise HTTPException(
+                status_code=503,
+                detail=f"All servers blocked by Cloudflare. Last error: {last_error}. Try again later or use a different episode."
+            )
+        
+        # Use the working stream
+        stream = working_stream
         sources = stream.get('sources', [])
-        
-        if not sources:
-            raise HTTPException(status_code=404, detail="No sources found")
-        
         source = sources[0]
         m3u8_url = source.get('file', '')
-        
-        if not m3u8_url:
-            raise HTTPException(status_code=404, detail="No M3U8 URL")
-        
         source_headers = source.get('headers', stream.get('headers', {}))
         referer = source_headers.get('Referer', 'https://megacloud.blog/')
         
@@ -1672,7 +1736,30 @@ async def download_video_mp4(
             # Get M3U8 playlist
             print("📋 Fetching playlist...")
             resp = await client.get(m3u8_url, headers=headers)
+            
+            # Check for Cloudflare block or HTML error page
+            if resp.status_code == 403:
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Stream blocked by Cloudflare (403). Try a different server or wait and retry."
+                )
+            
             m3u8_content = resp.text
+            
+            # Validate it's actually M3U8 and not an HTML error page
+            if '<!DOCTYPE' in m3u8_content or '<html' in m3u8_content.lower() or 'cloudflare' in m3u8_content.lower():
+                print(f"⚠️ Received HTML instead of M3U8 playlist (Cloudflare block detected)")
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Stream blocked by Cloudflare protection. Try server_index=1 or server_index=2 for alternative servers."
+                )
+            
+            if not m3u8_content.strip().startswith('#EXTM3U') and '#EXTINF' not in m3u8_content:
+                print(f"⚠️ Invalid M3U8 content received: {m3u8_content[:200]}")
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Invalid stream response. The server may be blocked or unavailable. Try a different server_index."
+                )
             
             base_url = m3u8_url.rsplit('/', 1)[0] + '/'
             
@@ -1720,7 +1807,23 @@ async def download_video_mp4(
                     
                     # Fetch the variant playlist
                     resp = await client.get(actual_m3u8_url, headers=headers)
+                    
+                    # Check for Cloudflare block on variant playlist
+                    if resp.status_code == 403:
+                        raise HTTPException(
+                            status_code=503, 
+                            detail="Variant stream blocked by Cloudflare (403). Try a different server."
+                        )
+                    
                     m3u8_content = resp.text
+                    
+                    # Validate variant playlist
+                    if '<!DOCTYPE' in m3u8_content or '<html' in m3u8_content.lower():
+                        raise HTTPException(
+                            status_code=503, 
+                            detail="Variant stream blocked by Cloudflare. Try server_index=1 or server_index=2."
+                        )
+                    
                     base_url = actual_m3u8_url.rsplit('/', 1)[0] + '/'
             
             # Parse segments from playlist
@@ -1728,6 +1831,13 @@ async def download_video_mp4(
             for line in m3u8_content.split('\n'):
                 line = line.strip()
                 if line and not line.startswith('#'):
+                    # Skip any HTML-like content that might have leaked through
+                    if '<' in line or '>' in line or 'DOCTYPE' in line or 'html' in line.lower():
+                        continue
+                    # Skip empty or whitespace-only lines
+                    if not line or line.isspace():
+                        continue
+                    # Build full URL
                     if line.startswith('http'):
                         segments.append(line)
                     else:
@@ -1737,11 +1847,23 @@ async def download_video_mp4(
             print(f"📦 Found {total} segments")
             
             if not segments:
+                raise HTTPException(status_code=500, detail="No segments found in playlist. The stream may be protected or unavailable.")
+            
+            # Validate that segments look like real video segments (not HTML paths)
+            invalid_segments = [s for s in segments[:5] if 'DOCTYPE' in s or '<html' in s.lower() or 'cloudflare' in s.lower()]
+            if invalid_segments:
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Stream is blocked by Cloudflare. Please try a different server (server_index=1 or 2)."
+                )
+            
+            if not segments:
                 raise HTTPException(status_code=500, detail="No segments found in playlist")
             
             # PARALLEL DOWNLOAD - 100 at a time!
             downloaded = [0]
             failed = [0]
+            blocked = [0]  # Track Cloudflare blocks specifically
             semaphore = asyncio.Semaphore(100)
             
             async def download_one(idx, url):
@@ -1750,8 +1872,24 @@ async def download_video_mp4(
                     for attempt in range(3):  # Retry up to 3 times
                         try:
                             r = await client.get(url, headers=headers)
+                            
+                            # Check for Cloudflare block
+                            if r.status_code == 403:
+                                blocked[0] += 1
+                                if blocked[0] <= 3:  # Only log first few
+                                    print(f"\n⚠️ Segment {idx} blocked (403)")
+                                return None
+                            
                             r.raise_for_status()
                             content = r.content
+                            
+                            # Check if we got HTML instead of video data
+                            if len(content) > 0 and content[:50].startswith(b'<!DOCTYPE') or b'<html' in content[:100].lower():
+                                blocked[0] += 1
+                                if blocked[0] <= 3:
+                                    print(f"\n⚠️ Segment {idx} returned HTML (Cloudflare block)")
+                                return None
+                            
                             if len(content) > 0:
                                 with open(path, 'wb') as f:
                                     f.write(content)
@@ -1775,8 +1913,17 @@ async def download_video_mp4(
             seg_files = [r for r in results if r]
             print(f"\n✅ Downloaded: {len(seg_files)}/{total} segments")
             
+            if blocked[0] > total * 0.5:
+                raise HTTPException(
+                    status_code=503, 
+                    detail=f"Most segments blocked by Cloudflare ({blocked[0]}/{total}). Server protection is active. Try again later."
+                )
+            
             if len(seg_files) < total * 0.9:
-                raise HTTPException(status_code=500, detail=f"Too many failures: {failed[0]}/{total}")
+                error_detail = f"Too many failures: {failed[0]} failed, {blocked[0]} blocked out of {total} segments"
+                if blocked[0] > 0:
+                    error_detail += ". Server may be protected by Cloudflare."
+                raise HTTPException(status_code=500, detail=error_detail)
         
         # ============================================
         # STEP 2: Convert to MP4 with FFmpeg
